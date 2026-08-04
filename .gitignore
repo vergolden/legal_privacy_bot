@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+.bot_listener_state.json
+.bot_listener_editing_state.json
+.DS_Store
