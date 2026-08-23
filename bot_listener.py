@@ -313,19 +313,23 @@ def send_photo_to_reviewers(api, env, post):
 
 
 def handle_image_request(api, env, callback_id, chat_id, posts_data, post, post_file):
-    if post.get("image_path"):
-        api.answer_callback_query(callback_id, text="Картинка уже сгенерирована.", show_alert=True)
-        return
-
     image_prompt = post.get("image_prompt")
     if not image_prompt:
         api.answer_callback_query(callback_id, text="У поста нет image_prompt для генерации.", show_alert=True)
         return
 
+    # Повторный клик после первой генерации — это осознанная перегенерация тем же
+    # промптом (кнопка меняет подпись на "🔄 Перегенерировать", см. post_buttons.py):
+    # у моделей генерации есть элемент случайности, картинка выйдет другой. Каждый
+    # клик — новый платный вызов ProxyAPI, старое фото в чате не удаляется (нет
+    # привязки message_id фото к посту), новое шлётся отдельным сообщением поверх.
+    is_regeneration = bool(post.get("image_path"))
+
     # Генерация может занять больше времени, чем Telegram ждёт ответа на callback_query
     # (после ~30-60 сек запрос считается устаревшим и answerCallbackQuery падает с
     # ошибкой) — отвечаем сразу, а результат отправляем обычным сообщением в чат.
-    api.answer_callback_query(callback_id, text="Генерирую картинку, обычно занимает до минуты…")
+    wait_text = "Перегенерирую картинку, обычно занимает до минуты…" if is_regeneration else "Генерирую картинку, обычно занимает до минуты…"
+    api.answer_callback_query(callback_id, text=wait_text)
 
     date_str = date_from_post_file(post_file)
     output_path = os.path.join(os.path.dirname(post_file), f"пост_{date_str}_id{post['id']}.png")

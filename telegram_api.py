@@ -16,6 +16,7 @@ import urllib.request
 import uuid
 
 TELEGRAM_API_BASE = "https://api.telegram.org"
+TELEGRAM_PHOTO_CAPTION_LIMIT = 1024  # жёсткий лимит Telegram Bot API на подпись к фото
 
 
 def load_env(env_path):
@@ -124,15 +125,16 @@ class TelegramAPI:
         return self._call_form("sendPhoto", bytes(body), f"multipart/form-data; boundary={boundary}")
 
     def send_illustrated_message(self, chat_id, image_path, text, reply_markup=None):
-        """Отправляет картинку и текст двумя сообщениями: фото без подписи,
-        затем текст обычным sendMessage (с кнопками, если заданы).
+        """Публикует пост с картинкой, если он помещается в лимит Telegram
+        (TELEGRAM_PHOTO_CAPTION_LIMIT символов) — тогда фото и текст идут одним
+        сообщением (подпись к фото), визуально выглядят как единое целое.
 
-        Раньше текст шёл подписью к фото (sendPhoto caption), но у Telegram
-        подпись ограничена 1024 символами — более длинные посты обрезались.
-        У обычного текстового сообщения лимит 4096, поэтому раздельная отправка
-        снимает ограничение. Возвращает результат отправки текстового сообщения
-        (это и есть основное сообщение — на него ссылаются id для правки/удаления)."""
-        self.send_photo(chat_id, image_path)
+        Если текст длиннее лимита, картинка не отправляется вообще (раньше в
+        этом случае фото и текст уходили двумя отдельными сообщениями — это
+        читалось как два несвязанных поста и не нравилось внешне). Возвращает
+        результат основного сообщения (на него ссылаются id для правки/удаления)."""
+        if len(text) <= TELEGRAM_PHOTO_CAPTION_LIMIT:
+            return self.send_photo(chat_id, image_path, caption=text, reply_markup=reply_markup)
         return self.send_message(chat_id, text, reply_markup=reply_markup, disable_preview=True)
 
     def edit_message_text(self, chat_id, message_id, text, reply_markup=None, disable_preview=False):
