@@ -89,8 +89,19 @@ def upload_photo(upload_url, image_path):
 def main():
     parser = argparse.ArgumentParser(description="Публикация поста в группу VK")
     parser.add_argument("--group-id", required=True, help="Числовой ID группы (без минуса)")
-    parser.add_argument("--text-file", required=True, help="Файл с текстом поста (plain text, UTF-8)")
+    parser.add_argument("--text-file", help="Файл с текстом поста (plain text, UTF-8) — обязателен, если не указан --delete")
     parser.add_argument("--image", help="Путь к картинке для прикрепления (опционально)")
+    parser.add_argument(
+        "--publish-date",
+        type=int,
+        help="Unixtime — отложить публикацию до этого момента (нативный отложенный постинг VK)",
+    )
+    parser.add_argument(
+        "--delete",
+        type=int,
+        metavar="POST_ID",
+        help="Удалить/отменить ранее запланированный пост с этим post_id (вместо публикации)",
+    )
     parser.add_argument(
         "--env-file",
         default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"),
@@ -102,14 +113,27 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.delete is None and not args.text_file:
+        parser.error("--text-file обязателен, если не указан --delete")
+
     env = load_env(os.path.abspath(args.env_file))
     user_token = env.get("VK_USER_TOKEN")
     community_token = env.get("VK_COMMUNITY_TOKEN")
+    group_id = args.group_id
+
+    if args.delete is not None:
+        if args.dry_run:
+            print(f"[DRY RUN] Удаление: owner_id=-{group_id}, post_id={args.delete}")
+            return
+        post_token = user_token or community_token
+        if not post_token:
+            sys.exit("Ошибка: не найден ни VK_USER_TOKEN, ни VK_COMMUNITY_TOKEN в .env")
+        vk_call("wall.delete", post_token, owner_id=f"-{group_id}", post_id=args.delete)
+        print(f"Удалено: post_id={args.delete}")
+        return
 
     with open(args.text_file, encoding="utf-8") as f:
         text = f.read()
-
-    group_id = args.group_id
 
     if args.dry_run:
         print("[DRY RUN] Группа:", group_id)
@@ -150,10 +174,15 @@ def main():
     }
     if attachment:
         post_params["attachments"] = attachment
+    if args.publish_date:
+        post_params["publish_date"] = args.publish_date
 
     result = vk_call("wall.post", post_token, **post_params)
     post_id = result["post_id"]
-    print(f"Опубликовано: post_id={post_id}")
+    if args.publish_date:
+        print(f"Запланировано: post_id={post_id}")
+    else:
+        print(f"Опубликовано: post_id={post_id}")
     print(f"Ссылка: https://vk.com/wall-{group_id}_{post_id}")
 
 

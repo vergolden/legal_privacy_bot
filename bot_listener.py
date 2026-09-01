@@ -18,6 +18,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -26,15 +27,20 @@ from datetime import datetime, timedelta, timezone
 
 from telegram_api import TelegramAPI, TelegramError, load_env
 from post_buttons import (
+    build_day_picker_keyboard,
+    build_plan_message_and_keyboard,
     build_post_keyboard,
     date_from_post_file,
     decode_callback,
+    decode_plan_cancel,
+    decode_sched_pick,
     find_post,
     format_post_message,
     load_posts_file,
     post_file_path,
     save_posts_file,
 )
+import scheduled_queue
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT_LP = os.path.dirname(SCRIPT_DIR)  # projects/legal_privacy
@@ -54,6 +60,7 @@ ORCHESTRATOR_PROMPT = (
 
 COMMANDS = {
     "digest": "Найти новости и подготовить черновик поста на утверждение",
+    "plan": "План отложенных публикаций — посмотреть и отменить при необходимости",
     "start": "Проверка связи с ботом",
 }
 
@@ -138,6 +145,56 @@ def write_tmp_text(text):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return path
+
+
+def next_candidate_days(today_dt, count=7):
+    """Следующие count дней, начиная с завтра — диапазон, который предлагается
+    в выборе дня для отложенной публикации."""
+    days = []
+    for offset in range(1, count + 1):
+        dt = today_dt + timedelta(days=offset)
+        days.append((dt.strftime("%d-%m-%Y"), dt))
+    return days
+
+
+def git_pull_quiet():
+    """Подтянуть изменения (например, статусы, которые GitHub Actions обновил
+    и запушил после публикации по расписанию) перед тем, как что-то показывать
+    или менять в очереди — без этого /plan мог бы показывать устаревший статус."""
+    try:
+        subprocess.run(
+            ["git", "pull", "--rebase", "--quiet"],
+            cwd=SCRIPT_DIR, check=True, capture_output=True, text=True, timeout=30,
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"git pull не удался: {e}")
+        return False
+
+
+def git_sync_and_push(rel_paths, commit_message):
+    """git pull + add + commit + push в репозитории scripts/ (legal_privacy_bot).
+    Нужно, чтобы GitHub Actions (запускается из отдельного checkout этого же
+    репозитория) увидел изменения очереди публикаций и мог опубликовать их
+    в назначенный день — без пуша очередь остаётся только на этом ноутбуке."""
+    git_pull_quiet()
+    try:
+        subprocess.run(
+            ["git", "add", *rel_paths], cwd=SCRIPT_DIR, check=True, capture_output=True, text=True, timeout=15
+        )
+        commit = subprocess.run(
+            ["git", "commit", "-m", commit_message], cwd=SCRIPT_DIR, capture_output=True, text=True, timeout=15
+        )
+        if commit.returncode != 0 and "nothing to commit" not in (commit.stdout + commit.stderr):
+            print(f"git commit: {commit.stdout} {commit.stderr}")
+            return False
+        subprocess.run(
+            ["git", "push", "--quiet"], cwd=SCRIPT_DIR, check=True, capture_output=True, text=True, timeout=30
+        )
+        return True
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        print(f"Ошибка git sync (очередь публикаций осталась только локально!): {e}")
+        return False
 
 
 def refresh_message_everywhere(api, env, post_file, post):
@@ -294,6 +351,199 @@ def handle_close(api, env, callback_id, requester, posts_data, post, post_file, 
     delete_message_everywhere(api, env, post)
 
 
+def cancel_schedule_entry(env, queue, entry, requester):
+    """Отменить запись очереди: если ВК уже поставил отложенный пост — снять его
+    (wall.delete), если Telegram ещё не опубликован — просто убрать из очереди.
+    Уже опубликованное (published/failed) отменой не трогаем — это факт, а не план."""
+    vk_info = entry.get("vk") or {}
+    if vk_info.get("status") == "scheduled" and vk_info.get("vk_post_id"):
+        cmd = [
+            "python3", os.path.join(SCRIPT_DIR, "publish_vk.py"),
+            "--group-id", vk_info.get("group_id") or env.get("VK_GROUP_ID", ""),
+            "--delete", str(vk_info["vk_post_id"]),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            print(f"Не удалось удалить отложенный пост в ВК (post_id={vk_info['vk_post_id']}): {result.stderr[-800:]}")
+        else:
+            vk_info["status"] = "deleted"
+
+    tg_info = entry.get("telegram") or {}
+    if tg_info.get("status") == "pending":
+        tg_info["status"] = "cancelled"
+
+    entry["cancelled"] = True
+    entry["cancelled_by"] = requester
+    entry["cancelled_at"] = now_iso()
+    scheduled_queue.save_queue(queue)
+    git_sync_and_push(["scheduled_queue"], f"Отменена запланированная публикация на {entry['day']} ({requester})")
+
+
+def handle_schedule_request(api, env, callback_id, chat_id, requester, post, post_file):
+    """Кнопка "📅 Запланировать" под черновиком — если пост ещё не запланирован,
+    прислать отдельным сообщением выбор дня; если уже запланирован, повторное
+    нажатие этой же кнопки отменяет план (см. подпись VERB, она это отражает)."""
+    post_id = post["id"]
+    rel_post_file = os.path.relpath(post_file, CLAUDE_CODE_ROOT)
+    queue = scheduled_queue.load_queue()
+    active_entry = scheduled_queue.find_active_entry_for_post(queue, rel_post_file, post_id)
+
+    if active_entry:
+        cancel_schedule_entry(env, queue, active_entry, requester)
+        api.answer_callback_query(callback_id, text=f"Отменено: было запланировано на {active_entry['day']}.")
+        posts_data = load_posts_file(post_file)
+        refreshed_post = find_post(posts_data, post_id) or post
+        refresh_message_everywhere(api, env, post_file, refreshed_post)
+        return
+
+    text = ((post.get("platforms") or {}).get("vk") or {}).get("content")
+    if not text:
+        api.answer_callback_query(callback_id, text="У поста нет текста для планирования.", show_alert=True)
+        return
+
+    date_str = date_from_post_file(post_file)
+    candidate_days = next_candidate_days(datetime.now(MSK))
+    taken = scheduled_queue.taken_days(queue)
+    if all(day_str in taken for day_str, _ in candidate_days):
+        api.answer_callback_query(callback_id, text="На ближайшую неделю все дни уже заняты.", show_alert=True)
+        return
+
+    keyboard = build_day_picker_keyboard(date_str, post_id, candidate_days, taken)
+    title = (post.get("source") or {}).get("title", "")
+    api.answer_callback_query(callback_id)
+    api.send_message(chat_id, f"На какой день поставить «{title}» (ВК + Telegram, публикация в 12:00 МСК)?", reply_markup=keyboard)
+
+
+def handle_schedule_pick(api, env, callback_id, chat_id, message_id, requester, data):
+    try:
+        post_file_date, post_id, day_str = decode_sched_pick(data)
+        post_file = post_file_path(post_file_date)
+    except ValueError as e:
+        api.answer_callback_query(callback_id, text=f"Не понял выбор дня: {e}", show_alert=True)
+        return
+
+    if not os.path.exists(post_file):
+        api.answer_callback_query(callback_id, text="Файл поста не найден.", show_alert=True)
+        return
+
+    posts_data = load_posts_file(post_file)
+    post = find_post(posts_data, post_id)
+    if post is None:
+        api.answer_callback_query(callback_id, text="Пост не найден в файле.", show_alert=True)
+        return
+
+    rel_post_file = os.path.relpath(post_file, CLAUDE_CODE_ROOT)
+    queue = scheduled_queue.load_queue()
+
+    if day_str in scheduled_queue.taken_days(queue):
+        api.answer_callback_query(callback_id, text="Этот день уже занят другим постом, выберите другой.", show_alert=True)
+        return
+    if scheduled_queue.find_active_entry_for_post(queue, rel_post_file, post_id):
+        api.answer_callback_query(callback_id, text="Этот пост уже запланирован.", show_alert=True)
+        return
+
+    text = ((post.get("platforms") or {}).get("vk") or {}).get("content")
+    if not text:
+        api.answer_callback_query(callback_id, text="У поста нет текста для планирования.", show_alert=True)
+        return
+
+    group_id = env.get("VK_GROUP_ID")
+    if not group_id:
+        api.answer_callback_query(callback_id, text="VK_GROUP_ID не задан в .env.", show_alert=True)
+        return
+
+    dd, mm, yyyy = day_str.split("-")
+    publish_dt = datetime(int(yyyy), int(mm), int(dd), 12, 0, 0, tzinfo=MSK)
+    publish_unixtime = int(publish_dt.timestamp())
+
+    image_path = resolve_image_path(post.get("image_path"))
+    tmp_text_file = write_tmp_text(text)
+    try:
+        cmd = [
+            "python3", os.path.join(SCRIPT_DIR, "publish_vk.py"),
+            "--group-id", group_id, "--text-file", tmp_text_file,
+            "--publish-date", str(publish_unixtime),
+        ]
+        if image_path:
+            cmd += ["--image", image_path]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    finally:
+        if os.path.exists(tmp_text_file):
+            os.remove(tmp_text_file)
+
+    if result.returncode != 0:
+        print(f"Ошибка планирования ВК: {result.stderr[-1500:]}")
+        api.answer_callback_query(callback_id, text="Ошибка планирования в ВК, смотрю лог.", show_alert=True)
+        return
+
+    m = re.search(r"post_id=(\d+)", result.stdout)
+    vk_post_id = int(m.group(1)) if m else None
+
+    image_file_name = None
+    if image_path and os.path.exists(image_path):
+        image_file_name = f"{day_str}_{post_file_date}_id{post_id}{os.path.splitext(image_path)[1]}"
+        try:
+            shutil.copyfile(image_path, os.path.join(scheduled_queue.IMAGES_DIR, image_file_name))
+        except OSError as e:
+            print(f"Не удалось скопировать картинку в очередь (пост уйдёт в Telegram без картинки): {e}")
+            image_file_name = None
+
+    title = (post.get("source") or {}).get("title", "")
+    scheduled_queue.add_entry(
+        queue,
+        post_file=rel_post_file, post_id=post_id, title=title,
+        day=day_str, time_str="12:00",
+        vk_post_id=vk_post_id, vk_group_id=group_id,
+        telegram_text=text, image_file=image_file_name,
+        scheduled_by=requester, scheduled_at=now_iso(),
+    )
+    scheduled_queue.save_queue(queue)
+    git_sync_and_push(["scheduled_queue"], f"Запланирован пост на {day_str} ({requester})")
+
+    api.answer_callback_query(callback_id, text=f"Запланировано на {day_str}.")
+    api.edit_message_text(chat_id, message_id, f"✅ Запланировано на {day_str} (ВК + Telegram, 12:00 МСК).", reply_markup={"inline_keyboard": []})
+    refresh_message_everywhere(api, env, post_file, post)
+
+
+def handle_plan_cancel(api, env, callback_id, chat_id, message_id, requester, data):
+    try:
+        entry_id = decode_plan_cancel(data)
+    except ValueError as e:
+        api.answer_callback_query(callback_id, text=f"Не понял отмену: {e}", show_alert=True)
+        return
+
+    queue = scheduled_queue.load_queue()
+    entry = scheduled_queue.get_entry(queue, entry_id)
+    if entry is None or entry.get("cancelled"):
+        api.answer_callback_query(callback_id, text="Запись уже отменена или не найдена.", show_alert=True)
+        return
+
+    cancel_schedule_entry(env, queue, entry, requester)
+    api.answer_callback_query(callback_id, text=f"Отменено: {entry['day']}.")
+
+    active = scheduled_queue.active_entries(queue)
+    text, keyboard = build_plan_message_and_keyboard(active)
+    api.edit_message_text(chat_id, message_id, text, reply_markup=keyboard or {"inline_keyboard": []})
+
+    try:
+        post_file = os.path.join(CLAUDE_CODE_ROOT, entry["post_file"])
+        if os.path.exists(post_file):
+            posts_data = load_posts_file(post_file)
+            post = find_post(posts_data, entry["post_id"])
+            if post is not None:
+                refresh_message_everywhere(api, env, post_file, post)
+    except Exception as e:
+        print(f"Не удалось обновить исходный пост после отмены плана: {e}")
+
+
+def handle_plan_command(api, chat_id):
+    git_pull_quiet()
+    queue = scheduled_queue.load_queue()
+    active = scheduled_queue.active_entries(queue)
+    text, keyboard = build_plan_message_and_keyboard(active)
+    api.send_message(chat_id, text, reply_markup=keyboard)
+
+
 def send_photo_to_reviewers(api, env, post):
     """После генерации картинки — отправить её отдельным сообщением (без подписи
     и кнопок) всем, кому уже отправлен черновик. Текстовое сообщение с кнопками
@@ -364,6 +614,7 @@ def handle_image_request(api, env, callback_id, chat_id, posts_data, post, post_
 def handle_callback(api, env, callback, allowed_chats, editing_state):
     callback_id = callback["id"]
     chat_id = str(callback["message"]["chat"]["id"])
+    message_id = callback["message"]["message_id"]
     data = callback.get("data", "")
 
     if chat_id not in allowed_chats:
@@ -371,6 +622,17 @@ def handle_callback(api, env, callback, allowed_chats, editing_state):
         return
 
     requester = allowed_chats[chat_id]
+    verb_prefix = data.split(":", 1)[0]
+
+    # У "sday" (выбор конкретного дня) и "plan_cancel" (отмена из /plan) другое
+    # число полей в callback_data — не влезают в общую схему "verb:date:id",
+    # поэтому разбираются отдельно, до общего decode_callback.
+    if verb_prefix == "sday":
+        handle_schedule_pick(api, env, callback_id, chat_id, message_id, requester, data)
+        return
+    if verb_prefix == "plan_cancel":
+        handle_plan_cancel(api, env, callback_id, chat_id, message_id, requester, data)
+        return
 
     try:
         verb, date_str, post_id = decode_callback(data)
@@ -399,6 +661,8 @@ def handle_callback(api, env, callback, allowed_chats, editing_state):
         handle_edit_request(api, callback_id, chat_id, post_file, post_id, editing_state)
     elif verb in ("arch", "rej"):
         handle_close(api, env, callback_id, requester, posts_data, post, post_file, verb)
+    elif verb == "sched":
+        handle_schedule_request(api, env, callback_id, chat_id, requester, post, post_file)
     else:
         api.answer_callback_query(callback_id, text="Неизвестное действие.", show_alert=True)
 
@@ -480,8 +744,10 @@ def main():
                     api.send_message(chat_id, "Бот на связи. Команда /digest запускает поиск новостей и подготовку черновика.")
                 elif text == "/digest":
                     run_pipeline(api, chat_id, requester)
+                elif text == "/plan":
+                    handle_plan_command(api, chat_id)
                 elif text.startswith("/"):
-                    api.send_message(chat_id, "Неизвестная команда. Доступно: /digest")
+                    api.send_message(chat_id, "Неизвестная команда. Доступно: /digest, /plan")
             except Exception as e:
                 print(f"Ошибка обработки update_id={update.get('update_id')}: {e!r}. Продолжаю работу.")
 

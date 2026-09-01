@@ -1,0 +1,41 @@
+name: Scheduled Telegram publish
+
+on:
+  schedule:
+    # 08:45 UTC = 11:45 МСК — запас ~15 минут до целевого времени публикации
+    # (12:00 МСК), т.к. у GitHub Actions cron есть разброс по времени срабатывания.
+    - cron: "45 8 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Publish due posts
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TELEGRAM_CHAT_ID_ANDREW: ${{ secrets.TELEGRAM_CHAT_ID_ANDREW }}
+          TELEGRAM_CHAT_ID_WIFE: ${{ secrets.TELEGRAM_CHAT_ID_WIFE }}
+        run: python3 run_scheduled_telegram.py
+
+      - name: Commit queue status update
+        run: |
+          git config user.name "legal-privacy-bot"
+          git config user.email "bot@legal-privacy.ru"
+          if ! git diff --quiet -- scheduled_queue/queue.json; then
+            git add scheduled_queue/queue.json
+            git commit -m "Автообновление статуса запланированных публикаций"
+            git push
+          else
+            echo "Очередь не изменилась — коммит не нужен."
+          fi
