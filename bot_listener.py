@@ -19,8 +19,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -83,6 +85,10 @@ ALLOWED_TOOLS = [
 CHANNEL_LABELS = {"vk": "ВК", "telegram": "Telegram-канал"}
 REVIEW_KEY_TO_ENV = {"andrew": "TELEGRAM_CHAT_ID_ANDREW", "wife": "TELEGRAM_CHAT_ID_WIFE"}
 
+# Пока пайплайн не запущен параллельно вторым /digest — иначе два процесса могут
+# одновременно писать в один и тот же дайджест/файл поста.
+pipeline_lock = threading.Lock()
+
 
 def load_json_state(path, default):
     if os.path.exists(path):
@@ -100,35 +106,95 @@ def now_iso():
     return datetime.now(MSK).isoformat()
 
 
+def send_with_retry(api, chat_id, text, attempts=3, delay=5):
+    """Статусные сообщения о пайплайне — единственный след для Андрея/Татьяны о том,
+    что вообще произошло. Разовый сетевой сбой в момент отправки не должен тихо
+    съедать это сообщение (как случилось 02.09.2026) — пробуем ещё пару раз."""
+    for attempt in range(1, attempts + 1):
+        try:
+            api.send_message(chat_id, text)
+            return True
+        except (TelegramError, urllib.error.URLError, OSError) as e:
+            print(f"Не удалось отправить статус пайплайна (попытка {attempt}/{attempts}): {e}", flush=True)
+            if attempt < attempts:
+                time.sleep(delay)
+    return False
+
+
+def run_subprocess_killing_group(cmd, cwd, timeout):
+    """Как subprocess.run(..., timeout=...), но по таймауту убивает всю группу
+    процессов, а не только прямого потомка.
+
+    claude -p может запустить субагента (инструмент Agent разрешён в ALLOWED_TOOLS),
+    который наследует pipe'ы stdout/stderr родителя. Штатный subprocess.run() при
+    таймауте убивает только сам claude -p и затем ЕЩЁ РАЗ вызывает communicate() —
+    уже без таймаута — чтобы дочитать вывод. Если субагент-«сирота» продолжает
+    держать pipe открытым, это второе чтение виснет навсегда: именно так /digest
+    от 02.09.2026 провисел ~65 минут вместо заявленных 15. start_new_session=True
+    кладёт claude -p и всех его потомков в одну группу процессов, которую можно
+    убить целиком через os.killpg — тогда pipe гарантированно закрывается и
+    финальный communicate() без таймаута безопасен."""
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return proc.returncode, stdout, stderr, False
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        stdout, stderr = proc.communicate()
+        return proc.returncode, stdout, stderr, True
+
+
 def run_pipeline(api, chat_id, requester):
-    api.send_message(
-        chat_id,
+    """Запускается из главного цикла — сам должен вернуться мгновенно, чтобы бот
+    не переставал отвечать на остальные сообщения и кнопки, пока идёт поиск
+    новостей (до 15 минут). Реальная работа — в фоновом потоке."""
+    if not pipeline_lock.acquire(blocking=False):
+        send_with_retry(api, chat_id, "Пайплайн уже выполняется — дождитесь его завершения, не запускаю второй.")
+        return
+
+    def worker():
+        try:
+            _run_pipeline_body(api, chat_id, requester)
+        finally:
+            pipeline_lock.release()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+def _run_pipeline_body(api, chat_id, requester):
+    send_with_retry(
+        api, chat_id,
         f"Инициатор: {requester}. Запускаю поиск новостей — это может занять пару минут, "
         f"пришлю черновик, как только будет готов.",
     )
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Запуск пайплайна (инициатор: {requester})")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Запуск пайплайна (инициатор: {requester})", flush=True)
     try:
-        result = subprocess.run(
+        returncode, stdout, stderr, timed_out = run_subprocess_killing_group(
             ["claude", "-p", ORCHESTRATOR_PROMPT, "--allowedTools", *ALLOWED_TOOLS],
             cwd=CLAUDE_CODE_ROOT,
-            capture_output=True,
-            text=True,
             timeout=900,
         )
-    except subprocess.TimeoutExpired:
-        api.send_message(chat_id, "Пайплайн не уложился в отведённое время (15 минут). Останавливаю, посмотрю логи.")
-        return
     except FileNotFoundError:
-        api.send_message(chat_id, "Не найден claude CLI в PATH на сервере, где запущен слушатель. Нужно поправить конфигурацию.")
+        send_with_retry(api, chat_id, "Не найден claude CLI в PATH на сервере, где запущен слушатель. Нужно поправить конфигурацию.")
         return
 
-    if result.returncode != 0:
-        print("STDERR:", result.stderr[-2000:])
-        api.send_message(chat_id, "Пайплайн завершился с ошибкой. Подробности в логе слушателя, посмотрю и поправлю.")
+    if timed_out:
+        send_with_retry(api, chat_id, "Пайплайн не уложился в отведённое время (15 минут). Останавливаю, посмотрю логи.")
         return
 
-    print("STDOUT:", result.stdout[-2000:])
-    api.send_message(chat_id, "Пайплайн отработал. Если черновик не пришёл отдельным сообщением — проверь лог слушателя.")
+    if returncode != 0:
+        print("STDERR:", stderr[-2000:], flush=True)
+        send_with_retry(api, chat_id, "Пайплайн завершился с ошибкой. Подробности в логе слушателя, посмотрю и поправлю.")
+        return
+
+    print("STDOUT:", stdout[-2000:], flush=True)
+    send_with_retry(api, chat_id, "Пайплайн отработал. Если черновик не пришёл отдельным сообщением — проверь лог слушателя.")
 
 
 def resolve_image_path(image_path):
@@ -668,6 +734,12 @@ def handle_callback(api, env, callback, allowed_chats, editing_state):
 
 
 def main():
+    # При запуске через nohup/redirect в файл stdout по умолчанию блочно буферизуется —
+    # реальные события (запуск пайплайна, ошибки) подолгу не попадают в лог, диагностика
+    # вслепую (как 02.09.2026, когда причина часового зависания не была видна в логе,
+    # пока процесс не завершился сам). Построчная буферизация решает это.
+    sys.stdout.reconfigure(line_buffering=True)
+
     env_path = os.path.join(PROJECT_ROOT_LP, ".env")
     env = load_env(env_path)
 

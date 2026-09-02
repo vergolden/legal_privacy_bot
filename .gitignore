@@ -4,3 +4,4 @@ __pycache__/
 .bot_listener_state.json
 .bot_listener_editing_state.json
 .DS_Store
+bot_listener.log
